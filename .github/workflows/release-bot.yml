@@ -18,16 +18,6 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
 
-    # GITHUB_TOKEN is the automatic per-run token — no setup required.
-    # It can create issues and post comments in rancher/observability-e2e.
-    # It can also read any public repo (rancher/rancher, rancher/charts).
-    # The only thing it cannot do is query the org-level Projects v2 board,
-    # which requires read:org + project scopes → that is what RANCHER_BOT_TOKEN
-    # is for (one PAT configured once by an admin in repo Settings → Secrets).
-    permissions:
-      issues: write       # create the release-tracking issue
-      contents: read      # checkout the repo
-
     steps:
       - uses: actions/checkout@v4
 
@@ -41,9 +31,9 @@ jobs:
 
       - name: Run bot
         env:
-          # GITHUB_TOKEN is auto-injected — no setup required.
-          # It has enough scope to call the search API and create issues.
-          GH_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          # PAT required: needs repo + read:org to search project:rancher/101
+          # and to create issues in rancher/observability-e2e
+          GH_TOKEN:       ${{ secrets.RANCHER_BOT_TOKEN }}
           ACTOR:          ${{ github.actor }}
           PROJECT_NUMBER: ${{ inputs.project_number }}
           DRY_RUN:        ${{ inputs.dry_run }}
