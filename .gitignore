@@ -1,3 +1,5 @@
 .env
 report.html
 report.md
+__pycache__/
+*.py[cod]

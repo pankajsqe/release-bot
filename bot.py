@@ -3,6 +3,7 @@ import datetime
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -38,14 +39,71 @@ CHARTS = [
     "rancher-backup",
 ]
 
+REQUEST_TIMEOUT_SEC = 30
+RETRY_ATTEMPTS = 5
+RETRY_BACKOFF_BASE_SEC = 1.5
+
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def _http_get(url, *, headers=None, params=None):
+    """GET with retry/backoff for transient network and GitHub 5xx/429 errors."""
+    last_err = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            r = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=REQUEST_TIMEOUT_SEC,
+            )
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_BASE_SEC ** attempt)
+                continue
+            return r
+        except requests.exceptions.RequestException as err:
+            last_err = err
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_BASE_SEC ** attempt)
+                continue
+            raise
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("HTTP GET failed unexpectedly")
+
+
+def _http_post(url, *, headers=None, json=None):
+    """POST with retry/backoff for transient network and GitHub 5xx/429 errors."""
+    last_err = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            r = requests.post(
+                url,
+                headers=headers,
+                json=json,
+                timeout=REQUEST_TIMEOUT_SEC,
+            )
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_BASE_SEC ** attempt)
+                continue
+            return r
+        except requests.exceptions.RequestException as err:
+            last_err = err
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_BASE_SEC ** attempt)
+                continue
+            raise
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("HTTP POST failed unexpectedly")
 
 def gh_get_paged(url, params=None):
     """Follow GitHub pagination and return the combined list."""
     items = []
     while url:
-        r = requests.get(url, headers=HEADERS, params=params)
+        r = _http_get(url, headers=HEADERS, params=params)
         r.raise_for_status()
         items.extend(r.json())
         url    = r.links.get("next", {}).get("url")
@@ -83,9 +141,8 @@ def find_latest_milestones():
 
 # ── Step 2 – Search board issues for each milestone via GitHub search API ────
 #
-# Query: is:issue state:open project:rancher/{PROJECT} milestone:{title}
-# This returns exactly the issues that are both open AND on the project board
-# AND in that milestone — no GraphQL or separate board fetch required.
+# Query: is:issue project:rancher/{PROJECT} milestone:{title}
+# This returns all issues (open + closed) on the project board for that milestone.
 
 def search_board_issues(milestone_title: str) -> list:
     """
@@ -99,7 +156,7 @@ def search_board_issues(milestone_title: str) -> list:
     params = {"q": q, "per_page": 100, "page": 1}
 
     while True:
-        r = requests.get(url, headers=HEADERS, params=params)
+        r = _http_get(url, headers=HEADERS, params=params)
         r.raise_for_status()
         data = r.json()
         issues.extend(data["items"])
@@ -112,88 +169,108 @@ def search_board_issues(milestone_title: str) -> list:
 
 # ── Step 3 – Fetch chart versions ─────────────────────────────────────────────
 #
-# Strategy: 2 API calls per chart × branch — fast regardless of how many
-# version directories exist in the chart.
-#
-#   Call 1: GET /repos/rancher/charts/commits
-#               ?path=charts/<chart>&sha=<branch>&per_page=1
-#           → latest commit SHA + committer date
-#
-#   Call 2: GET /repos/rancher/charts/commits/<sha>
-#           → list of files changed; extract the version dir from the path
-#             charts/<chart>/<version-dir>/...
-#
-# Then read Chart.yaml from that version dir for the canonical version string.
+# For each chart + release branch, pick two versions by most recent commit time:
+# - Released Versions: latest version WITHOUT "rc"
+# - Un-releaseed Versions: latest version WITH "rc"
 
-def latest_chart_version(chart: str, branch: str) -> dict:
-    """
-    Return {"version": str, "date": str} using the last-commit-date strategy.
-    """
-    # ── Call 1: latest commit that touched charts/<chart>/ ────────────────
-    r = requests.get(
-        f"{API}/repos/{OWNER}/{CHARTS_REPO}/commits",
-        headers=HEADERS,
-        params={"path": f"charts/{chart}", "sha": branch, "per_page": 1},
-    )
-    if r.status_code in (404, 422):
-        return {"version": "N/A", "date": ""}
-    r.raise_for_status()
-    commits = r.json()
-    if not commits:
-        return {"version": "N/A", "date": ""}
-
-    commit     = commits[0]
-    commit_sha = commit["sha"]
-    raw_date   = commit["commit"]["committer"]["date"]   # 2025-08-01T12:34:56Z
-    date       = raw_date[:10]                           # YYYY-MM-DD
-
-    # ── Call 2: files changed in that commit ─────────────────────────────
-    r2 = requests.get(
-        f"{API}/repos/{OWNER}/{CHARTS_REPO}/commits/{commit_sha}",
-        headers=HEADERS,
-    )
-    r2.raise_for_status()
-    files = r2.json().get("files", [])
-
-    # Extract version dir: charts/<chart>/<version-dir>/anything
-    version_dir = ""
-    prefix = f"charts/{chart}/"
-    for f in files:
-        fname = f.get("filename", "")
-        if fname.startswith(prefix):
-            rest = fname[len(prefix):]          # e.g. "110.0.0+up80.9.1/Chart.yaml"
-            part = rest.split("/")[0]           # e.g. "110.0.0+up80.9.1"
-            if part:
-                version_dir = part
-                break
-
-    if not version_dir:
-        return {"version": "N/A", "date": date}
-
-    # ── Read Chart.yaml for the canonical version string ──────────────────
-    r3 = requests.get(
+def _read_chart_yaml_version(chart: str, version_dir: str, branch: str) -> str:
+    """Return Chart.yaml version if available, otherwise fallback to directory name."""
+    r = _http_get(
         f"{API}/repos/{OWNER}/{CHARTS_REPO}/contents/charts/{chart}/{version_dir}/Chart.yaml",
         headers=HEADERS,
         params={"ref": branch},
     )
-    if r3.status_code == 404:
-        return {"version": version_dir, "date": date}
-    r3.raise_for_status()
+    if r.status_code == 404:
+        return version_dir
+    r.raise_for_status()
+    parsed = yaml.safe_load(base64.b64decode(r.json()["content"]).decode())
+    return parsed.get("version", version_dir)
 
-    parsed  = yaml.safe_load(base64.b64decode(r3.json()["content"]).decode())
-    version = parsed.get("version", version_dir)
-    return {"version": version, "date": date}
+
+def latest_chart_versions_split(chart: str, branch: str) -> dict:
+    """
+    Return latest released/unreleased versions by commit recency.
+    Output keys:
+      released_version, released_date, unreleased_version, unreleased_date
+    """
+    out = {
+        "released_version": "N/A",
+        "released_date": "",
+        "unreleased_version": "N/A",
+        "unreleased_date": "",
+    }
+
+    prefix = f"charts/{chart}/"
+    page = 1
+
+    # Commit list is newest-first, so first hit for each class is the latest.
+    while True:
+        r = _http_get(
+            f"{API}/repos/{OWNER}/{CHARTS_REPO}/commits",
+            headers=HEADERS,
+            params={"path": prefix.rstrip("/"), "sha": branch, "per_page": 100, "page": page},
+        )
+        if r.status_code in (404, 422):
+            break
+        r.raise_for_status()
+        commits = r.json()
+        if not commits:
+            break
+
+        for c in commits:
+            sha = c["sha"]
+            date = c["commit"]["committer"]["date"][:10]
+
+            detail = _http_get(
+                f"{API}/repos/{OWNER}/{CHARTS_REPO}/commits/{sha}",
+                headers=HEADERS,
+            )
+            detail.raise_for_status()
+            files = detail.json().get("files", [])
+
+            dirs = []
+            for f in files:
+                fname = f.get("filename", "")
+                if fname.startswith(prefix):
+                    rest = fname[len(prefix):]
+                    d = rest.split("/")[0]
+                    if d:
+                        dirs.append(d)
+
+            # Preserve first-seen order and remove duplicates
+            seen = set()
+            dirs = [d for d in dirs if not (d in seen or seen.add(d))]
+
+            for d in dirs:
+                is_rc = "rc" in d.lower()
+                if is_rc and out["unreleased_version"] == "N/A":
+                    out["unreleased_version"] = _read_chart_yaml_version(chart, d, branch)
+                    out["unreleased_date"] = date
+                if (not is_rc) and out["released_version"] == "N/A":
+                    out["released_version"] = _read_chart_yaml_version(chart, d, branch)
+                    out["released_date"] = date
+
+            if out["released_version"] != "N/A" and out["unreleased_version"] != "N/A":
+                return out
+
+        page += 1
+
+    return out
 
 
 def fetch_chart_versions() -> dict[str, dict[str, dict]]:
-    """Return {chart: {series: {"version": str, "date": str}}}."""
+    """Return {chart: {series: released/unreleased versions with dates}}."""
     result: dict = {}
     for chart in CHARTS:
         result[chart] = {}
         for v in VERSIONS:
-            info = latest_chart_version(chart, f"dev-{v}")
+            info = latest_chart_versions_split(chart, f"dev-{v}")
             result[chart][v] = info
-            print(f"    {chart} @ dev-{v}: {info['version']}  (last commit {info['date'] or 'unknown'})")
+            print(
+                f"    {chart} @ dev-{v}: "
+                f"released={info['released_version']} ({info['released_date'] or 'unknown'}), "
+                f"unreleased={info['unreleased_version']} ({info['unreleased_date'] or 'unknown'})"
+            )
     return result
 
 
@@ -222,7 +299,10 @@ def build_validation(milestones, board_issues, chart_versions) -> tuple[list[str
 
     for chart in CHARTS:
         any_found = any(
-            chart_versions.get(chart, {}).get(v, {}).get("version", "N/A") not in ("N/A", "")
+            (
+                chart_versions.get(chart, {}).get(v, {}).get("released_version", "N/A") not in ("N/A", "")
+                or chart_versions.get(chart, {}).get(v, {}).get("unreleased_version", "N/A") not in ("N/A", "")
+            )
             for v in VERSIONS
         )
         row(f"{chart} found", any_found)
@@ -297,20 +377,50 @@ def build_body(milestones, board_issues, chart_versions) -> str:
         lines += [
             f"### Release {label}",
             "",
-            "| Chart | Version | Last Commit | Done |",
-            "|---|---|---|---|",
+            "| Chart | Released Versions | Un-releaseed Versions | Owner | Done |",
+            "|---|---|---|---|---|",
         ]
         for chart in CHARTS:
             info    = chart_versions[chart].get(v, {})
-            version = info.get("version", "N/A")
-            date    = info.get("date") or "—"
-            lines.append(f"| {chart} | {version} | {date} | - [ ] |")
+            rel_cell, unrel_cell, _, _ = _format_chart_version_cells(info)
+            lines.append(f"| {chart} | {rel_cell} | {unrel_cell} |  | - [ ] |")
         lines.append("")
 
     return "\n".join(lines)
 
 
 # ── Report writers ───────────────────────────────────────────────────────────
+
+def _format_chart_version_cells(info: dict) -> tuple[str, str, bool, bool]:
+    """
+    Build released/unreleased display cells.
+    Rule: show unreleased only if unreleased_date > released_date.
+    """
+    rel_ver = info.get("released_version", "N/A")
+    rel_dt_raw = info.get("released_date") or ""
+    rel_dt = rel_dt_raw or "—"
+    rel_cell = f"{rel_ver} ({rel_dt})" if rel_ver != "N/A" else "N/A"
+
+    unrel_ver = info.get("unreleased_version", "N/A")
+    unrel_dt_raw = info.get("unreleased_date") or ""
+    unrel_dt = unrel_dt_raw or "—"
+
+    has_new_rc = (
+        unrel_ver != "N/A"
+        and rel_ver != "N/A"
+        and bool(unrel_dt_raw)
+        and bool(rel_dt_raw)
+        and unrel_dt_raw > rel_dt_raw
+    )
+
+    if has_new_rc:
+        unrel_cell = f"{unrel_ver} ({unrel_dt})"
+    else:
+        unrel_cell = "N/A (no new rc chart available)"
+
+    rel_na = rel_ver == "N/A"
+    unrel_na = not has_new_rc
+    return rel_cell, unrel_cell, rel_na, unrel_na
 
 def _val_html(val_lines: list[str]) -> str:
     rows = []
@@ -396,14 +506,15 @@ def write_html(milestones, board_issues, chart_versions, val_lines, val_ok,
         rows  = ""
         for chart in CHARTS:
             info    = chart_versions[chart].get(v, {})
-            version = info.get("version", "N/A")
-            date    = info.get("date") or "—"
-            na_cls  = " class='na'" if version == "N/A" else ""
+            rel_cell, unrel_cell, rel_na, unrel_na = _format_chart_version_cells(info)
+            rel_na_cls = " class='na'" if rel_na else ""
+            unrel_na_cls = " class='na'" if unrel_na else ""
             rows += (
                 f"<tr>"
                 f"<td class='chart-name'>{chart}</td>"
-                f"<td{na_cls}>{version}</td>"
-                f"<td class='date'>{date}</td>"
+                f"<td{rel_na_cls}>{rel_cell}</td>"
+                f"<td{unrel_na_cls}>{unrel_cell}</td>"
+                f"<td class='owner-col'></td>"
                 f"<td class='done-col'>☐</td>"
                 f"</tr>"
             )
@@ -411,7 +522,7 @@ def write_html(milestones, board_issues, chart_versions, val_lines, val_ok,
             f"<section>"
             f"<h3>Release {label}</h3>"
             f"<table>"
-            f"<thead><tr><th>Chart</th><th>Version</th><th>Last Commit</th><th>Done</th></tr></thead>"
+            f"<thead><tr><th>Chart</th><th>Released Versions</th><th>Un-releaseed Versions</th><th>Owner</th><th>Done</th></tr></thead>"
             f"<tbody>{rows}</tbody>"
             f"</table></section>"
         )
@@ -443,7 +554,8 @@ def write_html(milestones, board_issues, chart_versions, val_lines, val_ok,
   td.num {{ text-align: right; font-weight: 600; }}
   td.chart-name {{ font-family: monospace; white-space: nowrap; }}
   th.sub  {{ font-size:.78rem; font-weight:500; color:#57606a; background:#f6f8fa; }}
-  td.date {{ font-size:.8rem; color:#57606a; white-space:nowrap; }}
+    td.date {{ font-size:.8rem; color:#57606a; white-space:nowrap; }}
+    td.owner-col {{ min-width: 110px; }}
     td.done-col {{ min-width: 80px; text-align:center; color:#57606a; font-size:1rem; }}
   td.na   {{ color:#cf222e; font-style:italic; }}
   .state-open   {{ display:inline-block; padding:1px 7px; border-radius:10px;
@@ -529,7 +641,7 @@ def main():
     board_issues: dict = {}
     for v, ms in milestones.items():
         print(
-            f"  is:issue state:open project:{OWNER}/{PROJECT} milestone:{ms['title']}"
+            f"  is:issue project:{OWNER}/{PROJECT} milestone:{ms['title']}"
         )
         board_issues[v] = search_board_issues(ms["title"])
         print(f"    → {len(board_issues[v])} issues")
@@ -572,7 +684,7 @@ def main():
     if DRY_RUN:
         print("\nDRY RUN: No GitHub issue was created.")
     else:
-        issue = requests.post(
+        issue = _http_post(
             f"{API}/repos/{OWNER}/{REPO}/issues",
             headers=HEADERS,
             json={
