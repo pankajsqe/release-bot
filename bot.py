@@ -297,14 +297,14 @@ def build_body(milestones, board_issues, chart_versions) -> str:
         lines += [
             f"### Release {label}",
             "",
-            "| Chart | Version | Last Commit | Remark |",
+            "| Chart | Version | Last Commit | Done |",
             "|---|---|---|---|",
         ]
         for chart in CHARTS:
             info    = chart_versions[chart].get(v, {})
             version = info.get("version", "N/A")
             date    = info.get("date") or "—"
-            lines.append(f"| {chart} | {version} | {date} |  |")
+            lines.append(f"| {chart} | {version} | {date} | - [ ] |")
         lines.append("")
 
     return "\n".join(lines)
@@ -404,14 +404,14 @@ def write_html(milestones, board_issues, chart_versions, val_lines, val_ok,
                 f"<td class='chart-name'>{chart}</td>"
                 f"<td{na_cls}>{version}</td>"
                 f"<td class='date'>{date}</td>"
-                f"<td class='remark'></td>"
+                f"<td class='done-col'>☐</td>"
                 f"</tr>"
             )
         chart_sections.append(
             f"<section>"
             f"<h3>Release {label}</h3>"
             f"<table>"
-            f"<thead><tr><th>Chart</th><th>Version</th><th>Last Commit</th><th>Remark</th></tr></thead>"
+            f"<thead><tr><th>Chart</th><th>Version</th><th>Last Commit</th><th>Done</th></tr></thead>"
             f"<tbody>{rows}</tbody>"
             f"</table></section>"
         )
@@ -444,7 +444,7 @@ def write_html(milestones, board_issues, chart_versions, val_lines, val_ok,
   td.chart-name {{ font-family: monospace; white-space: nowrap; }}
   th.sub  {{ font-size:.78rem; font-weight:500; color:#57606a; background:#f6f8fa; }}
   td.date {{ font-size:.8rem; color:#57606a; white-space:nowrap; }}
-  td.remark {{ min-width: 120px; color:#57606a; font-style:italic; }}
+    td.done-col {{ min-width: 80px; text-align:center; color:#57606a; font-size:1rem; }}
   td.na   {{ color:#cf222e; font-style:italic; }}
   .state-open   {{ display:inline-block; padding:1px 7px; border-radius:10px;
                    background:#dafbe1; color:#116329; font-size:.78rem; font-weight:600;
