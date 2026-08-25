@@ -371,9 +371,11 @@ def build_body(milestones, board_issues, chart_versions) -> str:
     # Chart versions — one table per release, newest first
     lines.append("## Chart Versions")
     lines.append("")
+    checklist_by_release: dict[str, list[str]] = {}
     for v in reversed(VERSIONS):
         ms    = milestones.get(v)
         label = ms["title"] if ms else f"{v}.x"
+        checklist_by_release[label] = []
         lines += [
             f"### Release {label}",
             "",
@@ -384,6 +386,16 @@ def build_body(milestones, board_issues, chart_versions) -> str:
             info    = chart_versions[chart].get(v, {})
             rel_cell, unrel_cell, _, _ = _format_chart_version_cells(info)
             lines.append(f"| {chart} | {rel_cell} | {unrel_cell} |  | - [ ] |")
+            checklist_by_release[label].append(f"- [ ] {chart} — owner: @<assign>")
+        lines.append("")
+
+    # Clickable task list for QA sign-off in GitHub issue body.
+    lines.append("## Done Checklist")
+    lines.append("")
+    for label, items in checklist_by_release.items():
+        lines.append(f"### Release {label}")
+        lines.append("")
+        lines.extend(items)
         lines.append("")
 
     return "\n".join(lines)
