@@ -7,6 +7,7 @@ on:
         description: "GitHub Project number"
         required: true
         type: string
+        default: "101"
 
       dry_run:
         description: "Dry run - do not create GitHub issue"
@@ -31,10 +32,8 @@ jobs:
 
       - name: Run bot
         env:
-          # PAT required: needs repo + read:org to search project:rancher/101
-          # and to create issues in rancher/observability-e2e
-          GH_TOKEN:       ${{ secrets.RANCHER_BOT_TOKEN }}
-          ACTOR:          ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.RANCHER_BOT_TOKEN }}
+          ACTOR: ${{ github.actor }}
           PROJECT_NUMBER: ${{ inputs.project_number }}
-          DRY_RUN:        ${{ inputs.dry_run }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: python bot.py
