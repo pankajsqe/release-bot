@@ -11,7 +11,7 @@ import yaml
 
 # ── Config ─────────
 
-TOKEN   = os.environ["GH_TOKEN"]   # GITHUB_TOKEN — auto, no setup needed
+TOKEN   = os.environ["GH_TOKEN"]
 ACTOR   = os.environ["ACTOR"]
 PROJECT = int(os.environ["PROJECT_NUMBER"])
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
@@ -28,8 +28,11 @@ OWNER        = "rancher"
 REPO         = "observability-e2e"   # issue is always created here
 RANCHER_REPO = "rancher"             # milestones live here
 CHARTS_REPO  = "charts"             # chart versions live here
+SCC_REPO     = "scc-operator"       # SCC tags live here
+SHELL_REPO   = "shell"              # rancher-shell tags live here
 
 VERSIONS = ["v2.11", "v2.12", "v2.13", "v2.14", "v2.15"]
+SCC_VERSIONS = ["v2.13", "v2.14", "v2.15"]
 
 CHARTS = [
     "rancher-monitoring",
@@ -171,7 +174,7 @@ def search_board_issues(milestone_title: str) -> list:
 #
 # For each chart + release branch, pick two versions by most recent commit time:
 # - Released Versions: latest version WITHOUT "rc"
-# - Un-releaseed Versions: latest version WITH "rc"
+# - Un-released Versions: latest version WITH "rc"
 
 def _read_chart_yaml_version(chart: str, version_dir: str, branch: str) -> str:
     """Return Chart.yaml version if available, otherwise fallback to directory name."""
@@ -274,6 +277,121 @@ def fetch_chart_versions() -> dict[str, dict[str, dict]]:
     return result
 
 
+# ── Step 4 – Fetch SCC release versions from tags ───────────────────────────
+
+def _parse_scc_tag(tag: str):
+    """
+    Parse SCC tag formats like:
+      v0.5.1
+      v0.5.1-rc.3
+    Returns (major, minor, patch, rc_num_or_none) or None.
+    """
+    m = re.match(r"^v(\d+)\.(\d+)\.(\d+)(?:-rc\.?([0-9]+))?$", tag)
+    if not m:
+        return None
+    major = int(m.group(1))
+    minor = int(m.group(2))
+    patch = int(m.group(3))
+    rc_num = int(m.group(4)) if m.group(4) else None
+    return major, minor, patch, rc_num
+
+
+def _commit_date_for_sha(owner: str, repo: str, sha: str) -> str:
+    """Return commit date (YYYY-MM-DD) for a SHA, or empty string if unavailable."""
+    if not sha:
+        return ""
+    r = _http_get(
+        f"{API}/repos/{owner}/{repo}/commits/{sha}",
+        headers=HEADERS,
+    )
+    if r.status_code != 200:
+        return ""
+    data = r.json()
+    return (data.get("commit", {}).get("committer", {}).get("date", "") or "")[:10]
+
+
+def _fetch_repo_versions_for_rows(repo: str, row_versions: list[str], no_new_rc_msg: str) -> dict[str, dict[str, str]]:
+    """
+    Fetch latest stable and latest RC tags for a repo using vX.Y.Z / vX.Y.Z-rc.N tags.
+    RC is shown only if RC commit date > stable commit date.
+    """
+    tags = gh_get_paged(
+        f"{API}/repos/{OWNER}/{repo}/tags",
+        params={"per_page": 100},
+    )
+
+    latest_stable = "N/A"
+    latest_rc = "N/A"
+    latest_stable_sha = ""
+    latest_rc_sha = ""
+    stable_key = (-1, -1, -1)
+    rc_key = (-1, -1, -1, -1)
+
+    for t in tags:
+        name = t.get("name", "")
+        parsed = _parse_scc_tag(name)
+        if not parsed:
+            continue
+        major, minor, patch, rc_num = parsed
+        if rc_num is None:
+            k = (major, minor, patch)
+            if k > stable_key:
+                stable_key = k
+                latest_stable = name
+                latest_stable_sha = t.get("commit", {}).get("sha", "")
+        else:
+            k = (major, minor, patch, rc_num)
+            if k > rc_key:
+                rc_key = k
+                latest_rc = name
+                latest_rc_sha = t.get("commit", {}).get("sha", "")
+
+    stable_date = _commit_date_for_sha(OWNER, repo, latest_stable_sha)
+    rc_date = _commit_date_for_sha(OWNER, repo, latest_rc_sha)
+
+    rc_to_show = no_new_rc_msg
+    if (
+        latest_rc != "N/A"
+        and latest_stable != "N/A"
+        and rc_date
+        and stable_date
+        and rc_date > stable_date
+    ):
+        rc_to_show = latest_rc
+
+    return {
+        v: {
+            "stable": latest_stable,
+            "rc": rc_to_show,
+        }
+        for v in row_versions
+    }
+
+
+def fetch_scc_versions() -> dict[str, dict[str, str]]:
+    """
+    Return SCC latest stable and latest rc tags for v2.13..v2.15.
+    Output: {"v2.13": {"stable": "...", "rc": "..."}, ...}
+    """
+    return _fetch_repo_versions_for_rows(
+        SCC_REPO,
+        SCC_VERSIONS,
+        "N/A (no new rc version available)",
+    )
+
+
+def fetch_shell_versions() -> dict[str, dict[str, str]]:
+    """
+    Return rancher-shell latest stable and latest rc tags for v2.11..v2.15 rows.
+    Output: {"v2.13": {"stable": "...", "rc": "..."}, ...}
+    """
+    return _fetch_repo_versions_for_rows(
+        SHELL_REPO,
+        VERSIONS,
+        "N/A (no new rc version available)",
+    )
+
+
 # ── Step 5 – Validate ─────────────────────────────────────────────────────────
 
 def build_validation(milestones, board_issues, chart_versions) -> tuple[list[str], bool]:
@@ -314,7 +432,7 @@ def build_validation(milestones, board_issues, chart_versions) -> tuple[list[str
 
 # ── Step 6 – Build issue body ─────────────────────────────────────────────────
 
-def build_body(milestones, board_issues, chart_versions) -> str:
+def build_body(milestones, board_issues, chart_versions, scc_versions, shell_versions) -> str:
     """
     board_issues = {series: [issue, ...]} — all issues (open + closed) on the
     project board for that milestone.
@@ -379,7 +497,7 @@ def build_body(milestones, board_issues, chart_versions) -> str:
         lines += [
             f"### Release {label}",
             "",
-            "| Chart | Released Versions | Un-releaseed Versions | Owner | Done |",
+            "| Chart | Released Versions | Un-released Versions | Owner | Done |",
             "|---|---|---|---|---|",
         ]
         for chart in CHARTS:
@@ -387,6 +505,16 @@ def build_body(milestones, board_issues, chart_versions) -> str:
             rel_cell, unrel_cell, _, _ = _format_chart_version_cells(info)
             lines.append(f"| {chart} | {rel_cell} | {unrel_cell} |  | - [ ] |")
             checklist_by_release[label].append(f"- [ ] {chart} — owner: @<assign>")
+
+        if v in SCC_VERSIONS:
+            scc_row = scc_versions.get(v, {"stable": "N/A", "rc": "N/A (no new rc version available)"})
+            lines.append(f"| scc-operator | {scc_row['stable']} | {scc_row['rc']} |  | - [ ] |")
+            checklist_by_release[label].append("- [ ] scc-operator — owner: @<assign>")
+
+        if v in VERSIONS:
+            shell_row = shell_versions.get(v, {"stable": "N/A", "rc": "N/A (no new rc version available)"})
+            lines.append(f"| rancher-shell | {shell_row['stable']} | {shell_row['rc']} |  | - [ ] |")
+            checklist_by_release[label].append("- [ ] rancher-shell — owner: @<assign>")
         lines.append("")
 
     # Clickable task list for QA sign-off in GitHub issue body.
@@ -447,7 +575,7 @@ def _val_html(val_lines: list[str]) -> str:
     return "<ul class='validation'>" + "".join(rows) + "</ul>"
 
 
-def write_html(milestones, board_issues, chart_versions, val_lines, val_ok,
+def write_html(milestones, board_issues, chart_versions, scc_versions, shell_versions, val_lines, val_ok,
                issue_url: str | None = None) -> Path:
     now   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     mode  = "DRY RUN" if DRY_RUN else "LIVE"
@@ -530,11 +658,38 @@ def write_html(milestones, board_issues, chart_versions, val_lines, val_ok,
                 f"<td class='done-col'>☐</td>"
                 f"</tr>"
             )
+
+        if v in SCC_VERSIONS:
+            scc_row = scc_versions.get(v, {"stable": "N/A", "rc": "N/A (no new rc version available)"})
+            scc_unrel_na_cls = " class='na'" if scc_row["rc"].startswith("N/A") else ""
+            rows += (
+                f"<tr>"
+                f"<td class='chart-name'>scc-operator</td>"
+                f"<td>{scc_row['stable']}</td>"
+                f"<td{scc_unrel_na_cls}>{scc_row['rc']}</td>"
+                f"<td class='owner-col'></td>"
+                f"<td class='done-col'>☐</td>"
+                f"</tr>"
+            )
+
+        if v in VERSIONS:
+            shell_row = shell_versions.get(v, {"stable": "N/A", "rc": "N/A (no new rc version available)"})
+            shell_unrel_na_cls = " class='na'" if shell_row["rc"].startswith("N/A") else ""
+            rows += (
+                f"<tr>"
+                f"<td class='chart-name'>rancher-shell</td>"
+                f"<td>{shell_row['stable']}</td>"
+                f"<td{shell_unrel_na_cls}>{shell_row['rc']}</td>"
+                f"<td class='owner-col'></td>"
+                f"<td class='done-col'>☐</td>"
+                f"</tr>"
+            )
+
         chart_sections.append(
             f"<section>"
             f"<h3>Release {label}</h3>"
             f"<table>"
-            f"<thead><tr><th>Chart</th><th>Released Versions</th><th>Un-releaseed Versions</th><th>Owner</th><th>Done</th></tr></thead>"
+            f"<thead><tr><th>Chart</th><th>Released Versions</th><th>Un-released Versions</th><th>Owner</th><th>Done</th></tr></thead>"
             f"<tbody>{rows}</tbody>"
             f"</table></section>"
         )
@@ -661,7 +816,19 @@ def main():
     print("Fetching chart versions …")
     chart_versions = fetch_chart_versions()
 
-    body              = build_body(milestones, board_issues, chart_versions)
+    print("Fetching SCC versions …")
+    scc_versions = fetch_scc_versions()
+    for v in reversed(SCC_VERSIONS):
+        row = scc_versions.get(v, {"stable": "N/A", "rc": "N/A"})
+        print(f"    {v}: stable={row['stable']}, rc={row['rc']}")
+
+    print("Fetching rancher-shell versions …")
+    shell_versions = fetch_shell_versions()
+    for v in reversed(SCC_VERSIONS):
+        row = shell_versions.get(v, {"stable": "N/A", "rc": "N/A"})
+        print(f"    {v}: stable={row['stable']}, rc={row['rc']}")
+
+    body              = build_body(milestones, board_issues, chart_versions, scc_versions, shell_versions)
     val_lines, val_ok = build_validation(milestones, board_issues, chart_versions)
 
     # ---------------------------------------------------------
@@ -709,7 +876,7 @@ def main():
         print("\nCreated:", issue_url)
 
     # ── Write local reports ───────────────────────────────────────────────────
-    html_path = write_html(milestones, board_issues, chart_versions,
+    html_path = write_html(milestones, board_issues, chart_versions, scc_versions, shell_versions,
                            val_lines, val_ok, issue_url)
     md_path   = write_markdown(body, val_lines, val_ok, issue_url)
     print(f"\nReports written:")
