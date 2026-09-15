@@ -15,6 +15,36 @@ on:
         type: boolean
         default: true
 
+      milestone_v215:
+        description: "Milestone for v2.15 series; use auto or a value like v2.15.2"
+        required: true
+        type: string
+        default: "auto"
+
+      milestone_v214:
+        description: "Milestone for v2.14 series; use auto or a value like v2.14.6"
+        required: true
+        type: string
+        default: "auto"
+
+      milestone_v213:
+        description: "Milestone for v2.13 series; use auto or a value like v2.13.10"
+        required: true
+        type: string
+        default: "auto"
+
+      milestone_v212:
+        description: "Milestone for v2.12 series; use auto or a value like v2.12.14"
+        required: true
+        type: string
+        default: "auto"
+
+      milestone_v211:
+        description: "Milestone for v2.11 series; use auto or a value like v2.11.18"
+        required: true
+        type: string
+        default: "auto"
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -36,4 +66,27 @@ jobs:
           ACTOR: ${{ github.actor }}
           PROJECT_NUMBER: ${{ inputs.project_number }}
           DRY_RUN: ${{ inputs.dry_run }}
+          MILESTONE_V215: ${{ inputs.milestone_v215 }}
+          MILESTONE_V214: ${{ inputs.milestone_v214 }}
+          MILESTONE_V213: ${{ inputs.milestone_v213 }}
+          MILESTONE_V212: ${{ inputs.milestone_v212 }}
+          MILESTONE_V211: ${{ inputs.milestone_v211 }}
         run: python bot.py
+
+      - name: Upload report.html artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bot-report-html
+          path: report.html
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload report.md artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bot-report-md
+          path: report.md
+          if-no-files-found: error
+          retention-days: 30

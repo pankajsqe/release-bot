@@ -1,4 +1,5 @@
 import base64
+import argparse
 import datetime
 import os
 import re
@@ -11,18 +12,19 @@ import yaml
 
 # ── Config ─────────
 
-TOKEN   = os.environ["GH_TOKEN"]
-ACTOR   = os.environ["ACTOR"]
-PROJECT = int(os.environ["PROJECT_NUMBER"])
+TOKEN   = os.environ.get("GH_TOKEN", "")
+ACTOR   = os.environ.get("ACTOR", "")
+PROJECT = int(os.environ.get("PROJECT_NUMBER", "101"))
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+MILESTONE_V211 = os.environ.get("MILESTONE_V211", "").strip()
+MILESTONE_V212 = os.environ.get("MILESTONE_V212", "").strip()
+MILESTONE_V213 = os.environ.get("MILESTONE_V213", "").strip()
+MILESTONE_V214 = os.environ.get("MILESTONE_V214", "").strip()
+MILESTONE_V215 = os.environ.get("MILESTONE_V215", "").strip()
 
 API = "https://api.github.com"
 
-HEADERS = {
-    "Authorization":        f"Bearer {TOKEN}",
-    "Accept":               "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-}
+HEADERS = {}
 
 OWNER        = "rancher"
 REPO         = "observability-e2e"   # issue is always created here
@@ -45,6 +47,88 @@ CHARTS = [
 REQUEST_TIMEOUT_SEC = 30
 RETRY_ATTEMPTS = 5
 RETRY_BACKOFF_BASE_SEC = 1.5
+
+
+def _to_bool(value: str) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _load_env_file(path: str) -> None:
+    """Load KEY=VALUE pairs from an env file into os.environ when unset."""
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Rancher release tracking bot")
+    parser.add_argument("--env-file", default=".env", help="Path to .env file for local runs")
+    parser.add_argument("--gh-token", help="GitHub token override")
+    parser.add_argument("--actor", help="GitHub actor/user override")
+    parser.add_argument("--project-number", help="Project number override")
+    parser.add_argument("--dry-run", help="Dry run mode (true/false)")
+    parser.add_argument("--milestone-v211", help="Milestone title for v2.11")
+    parser.add_argument("--milestone-v212", help="Milestone title for v2.12")
+    parser.add_argument("--milestone-v213", help="Milestone title for v2.13")
+    parser.add_argument("--milestone-v214", help="Milestone title for v2.14")
+    parser.add_argument("--milestone-v215", help="Milestone title for v2.15")
+    return parser.parse_args()
+
+
+def configure_runtime(args: argparse.Namespace) -> None:
+    """Resolve runtime configuration from CLI and environment."""
+    global TOKEN, ACTOR, PROJECT, DRY_RUN
+    global MILESTONE_V211, MILESTONE_V212, MILESTONE_V213, MILESTONE_V214, MILESTONE_V215
+    global HEADERS
+
+    if args.env_file:
+        _load_env_file(args.env_file)
+
+    token = (args.gh_token or os.environ.get("GH_TOKEN", "")).strip()
+    actor = (args.actor or os.environ.get("ACTOR", "")).strip()
+    project_raw = (args.project_number or os.environ.get("PROJECT_NUMBER", "101")).strip()
+    dry_raw = args.dry_run if args.dry_run is not None else os.environ.get("DRY_RUN", "true")
+
+    if not token:
+        raise ValueError("Missing GH_TOKEN. Set it in env/.env or pass --gh-token.")
+    if not actor:
+        raise ValueError("Missing ACTOR. Set it in env/.env or pass --actor.")
+
+    try:
+        project = int(project_raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid PROJECT_NUMBER: {project_raw}") from exc
+
+    TOKEN = token
+    ACTOR = actor
+    PROJECT = project
+    DRY_RUN = _to_bool(dry_raw)
+
+    def _normalize_milestone(value: str | None) -> str:
+        cleaned = (value or "").strip()
+        return "" if cleaned.lower() == "auto" else cleaned
+
+    MILESTONE_V211 = _normalize_milestone(args.milestone_v211 or os.environ.get("MILESTONE_V211", ""))
+    MILESTONE_V212 = _normalize_milestone(args.milestone_v212 or os.environ.get("MILESTONE_V212", ""))
+    MILESTONE_V213 = _normalize_milestone(args.milestone_v213 or os.environ.get("MILESTONE_V213", ""))
+    MILESTONE_V214 = _normalize_milestone(args.milestone_v214 or os.environ.get("MILESTONE_V214", ""))
+    MILESTONE_V215 = _normalize_milestone(args.milestone_v215 or os.environ.get("MILESTONE_V215", ""))
+
+    HEADERS = {
+        "Authorization":        f"Bearer {TOKEN}",
+        "Accept":               "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -116,7 +200,7 @@ def gh_get_paged(url, params=None):
 
 # ── Step 1 – Find latest milestones ──────────────────────────────────────────
 
-def find_latest_milestones():
+def find_latest_milestones(selected_titles: dict[str, str] | None = None):
     """
     Return {series: milestone_dict} mapping the latest v2.NN.x milestone
     (open or closed) for each series in VERSIONS.
@@ -127,6 +211,25 @@ def find_latest_milestones():
     )
 
     latest: dict = {}
+    by_title = {ms.get("title", ""): ms for ms in milestones}
+
+    selected_titles = selected_titles or {}
+    for series in VERSIONS:
+        selected = selected_titles.get(series, "").strip()
+        if not selected:
+            continue
+
+        chosen = by_title.get(selected)
+        if chosen:
+            chosen_copy = dict(chosen)
+            chosen_copy["_exists"] = True
+            latest[series] = chosen_copy
+        else:
+            latest[series] = {
+                "title": selected,
+                "_exists": False,
+            }
+
     for ms in milestones:
         m = re.match(r"^(v2\.\d+)\.(\d+)$", ms["title"])
         if not m:
@@ -134,10 +237,14 @@ def find_latest_milestones():
         series = m.group(1)
         if series not in VERSIONS:
             continue
+        if series in latest:
+            continue
         patch = int(m.group(2))
         prev  = latest.get(series)
         if prev is None or patch > int(re.search(r"\.(\d+)$", prev["title"]).group(1)):
-            latest[series] = ms
+            ms_copy = dict(ms)
+            ms_copy["_exists"] = True
+            latest[series] = ms_copy
 
     return latest
 
@@ -409,11 +516,13 @@ def build_validation(milestones, board_issues, chart_versions) -> tuple[list[str
 
     for v in VERSIONS:
         ms = milestones.get(v)
-        if ms:
+        if ms and ms.get("_exists", True):
             count = len(board_issues.get(v, []))
             row(f"{v}.x milestone found — {ms['title']} ({count} board issues)", True)
+        elif ms and not ms.get("_exists", True):
+            lines.append(f"  ! {v}.x selected milestone not present — {ms['title']}")
         else:
-            row(f"{v}.x milestone NOT found", False)
+            lines.append(f"  ! {v}.x milestone not present")
 
     for chart in CHARTS:
         any_found = any(
@@ -432,7 +541,8 @@ def build_validation(milestones, board_issues, chart_versions) -> tuple[list[str
 
 # ── Step 6 – Build issue body ─────────────────────────────────────────────────
 
-def build_body(milestones, board_issues, chart_versions, scc_versions, shell_versions) -> str:
+def build_body(milestones, board_issues, chart_versions, scc_versions, shell_versions,
+               val_lines: list[str], val_ok: bool) -> str:
     """
     board_issues = {series: [issue, ...]} — all issues (open + closed) on the
     project board for that milestone.
@@ -445,6 +555,15 @@ def build_body(milestones, board_issues, chart_versions, scc_versions, shell_ver
         f"Generated by: @{ACTOR}",
         "",
     ]
+
+    # Validation section (same structure as report.html)
+    lines += ["## Validation", ""]
+    for line in val_lines:
+        text = line.strip()
+        if not text or text.startswith("RESULT"):
+            continue
+        lines.append(f"- {text}")
+    lines += ["", f"**RESULT: {'PASS' if val_ok else 'FAIL'}**", ""]
 
     # Summary table
     lines += [
@@ -472,28 +591,26 @@ def build_body(milestones, board_issues, chart_versions, scc_versions, shell_ver
         if not ms:
             continue
         issues = board_issues.get(v, [])
-        lines += [f"### {ms['title']}", ""]
+        n_open = sum(1 for i in issues if i.get("state") == "open")
+        n_closed = sum(1 for i in issues if i.get("state") == "closed")
+        lines += [f"### {ms['title']} ({n_open} open, {n_closed} closed)", ""]
         if not issues:
             lines.append("_No issues found on the board for this milestone._")
         else:
             for issue in issues:
-                state = issue["state"]          # "open" or "closed"
-                state_tag = "🟢 open" if state == "open" else "✅ closed"
-                checkbox  = "[ ]" if state == "open" else "[x]"
+                state = issue.get("state", "open")
                 lines.append(
-                    f"- {checkbox} `{state_tag}` [#{issue['number']}]({issue['html_url']})"
-                    f" — {issue['title']}"
+                    f"- **{state}** [#{issue['number']}]({issue['html_url']})"
+                    f" - {issue['title']}"
                 )
         lines.append("")
 
-    # Chart versions — one table per release, newest first
+    # Chart versions — markdown tables keep the issue editable in GitHub
     lines.append("## Chart Versions")
     lines.append("")
-    checklist_by_release: dict[str, list[str]] = {}
     for v in reversed(VERSIONS):
         ms    = milestones.get(v)
         label = ms["title"] if ms else f"{v}.x"
-        checklist_by_release[label] = []
         lines += [
             f"### Release {label}",
             "",
@@ -501,29 +618,18 @@ def build_body(milestones, board_issues, chart_versions, scc_versions, shell_ver
             "|---|---|---|---|---|",
         ]
         for chart in CHARTS:
-            info    = chart_versions[chart].get(v, {})
+            info = chart_versions.get(chart, {}).get(v, {})
             rel_cell, unrel_cell, _, _ = _format_chart_version_cells(info)
-            lines.append(f"| {chart} | {rel_cell} | {unrel_cell} |  | - [ ] |")
-            checklist_by_release[label].append(f"- [ ] {chart} — owner: @<assign>")
+            lines.append(f"| {chart} | {rel_cell} | {unrel_cell} |  | [ ] |")
 
         if v in SCC_VERSIONS:
             scc_row = scc_versions.get(v, {"stable": "N/A", "rc": "N/A (no new rc version available)"})
-            lines.append(f"| scc-operator | {scc_row['stable']} | {scc_row['rc']} |  | - [ ] |")
-            checklist_by_release[label].append("- [ ] scc-operator — owner: @<assign>")
+            lines.append(f"| scc-operator | {scc_row['stable']} | {scc_row['rc']} |  | [ ] |")
 
         if v in VERSIONS:
             shell_row = shell_versions.get(v, {"stable": "N/A", "rc": "N/A (no new rc version available)"})
-            lines.append(f"| rancher-shell | {shell_row['stable']} | {shell_row['rc']} |  | - [ ] |")
-            checklist_by_release[label].append("- [ ] rancher-shell — owner: @<assign>")
-        lines.append("")
+            lines.append(f"| rancher-shell | {shell_row['stable']} | {shell_row['rc']} |  | [ ] |")
 
-    # Clickable task list for QA sign-off in GitHub issue body.
-    lines.append("## Done Checklist")
-    lines.append("")
-    for label, items in checklist_by_release.items():
-        lines.append(f"### Release {label}")
-        lines.append("")
-        lines.extend(items)
         lines.append("")
 
     return "\n".join(lines)
@@ -788,7 +894,22 @@ def write_html(milestones, board_issues, chart_versions, scc_versions, shell_ver
 def write_markdown(body: str, val_lines: list[str], val_ok: bool,
                    issue_url: str | None = None) -> Path:
     now   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines = [f"<!-- generated {now} -->", ""]
+    lines = [f"<!-- generated {now} -->", "", "## Ticket Preview", ""]
+    lines += [
+        f"- Repository: {OWNER}/{REPO}",
+        f"- Triggered by: @{ACTOR}",
+        f"- Project: #{PROJECT}",
+        f"- Dry run: {'true' if DRY_RUN else 'false'}",
+        "- Selected milestones:",
+        f"  - v2.11: {MILESTONE_V211 or '(auto)'}",
+        f"  - v2.12: {MILESTONE_V212 or '(auto)'}",
+        f"  - v2.13: {MILESTONE_V213 or '(auto)'}",
+        f"  - v2.14: {MILESTONE_V214 or '(auto)'}",
+        f"  - v2.15: {MILESTONE_V215 or '(auto)'}",
+        "",
+        "## Ticket Body",
+        "",
+    ]
     lines += body.splitlines()
     if issue_url:
         lines += ["", "---", "", f"**Issue created:** {issue_url}"]
@@ -801,8 +922,22 @@ def write_markdown(body: str, val_lines: list[str], val_ok: bool,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    args = _parse_args()
+    try:
+        configure_runtime(args)
+    except ValueError as exc:
+        print(f"Configuration error: {exc}")
+        sys.exit(2)
+
     print("Fetching milestones …")
-    milestones = find_latest_milestones()
+    selected_milestones = {
+        "v2.11": MILESTONE_V211,
+        "v2.12": MILESTONE_V212,
+        "v2.13": MILESTONE_V213,
+        "v2.14": MILESTONE_V214,
+        "v2.15": MILESTONE_V215,
+    }
+    milestones = find_latest_milestones(selected_milestones)
 
     print("Searching project board issues …")
     board_issues: dict = {}
@@ -828,8 +963,9 @@ def main():
         row = shell_versions.get(v, {"stable": "N/A", "rc": "N/A"})
         print(f"    {v}: stable={row['stable']}, rc={row['rc']}")
 
-    body              = build_body(milestones, board_issues, chart_versions, scc_versions, shell_versions)
     val_lines, val_ok = build_validation(milestones, board_issues, chart_versions)
+    body              = build_body(milestones, board_issues, chart_versions, scc_versions, shell_versions,
+                                   val_lines, val_ok)
 
     # ---------------------------------------------------------
     # Dry run / Create issue

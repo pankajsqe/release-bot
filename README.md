@@ -50,12 +50,40 @@ GH_TOKEN=ghp_xxx
 ACTOR=your-github-username
 PROJECT_NUMBER=githubprojectnumber
 DRY_RUN=true
+MILESTONE_V215=v2.15.2
+MILESTONE_V214=v2.14.6
+MILESTONE_V213=v2.13.10
+MILESTONE_V212=v2.12.14
+MILESTONE_V211=v2.11.18
 ```
 
-4. Run:
+You can also set any milestone value to `auto` in `.env` to let the bot pick
+the newest milestone automatically for that series.
+
+4. Run with shell-exported env:
 
 ```bash
 set -a && source .env && set +a && python3 bot.py
+```
+
+5. Or run directly with `.env` file loading (no `source` needed):
+
+```bash
+python3 bot.py --env-file .env
+```
+
+6. Optional CLI overrides (CLI takes precedence over `.env`/env vars):
+
+```bash
+python3 bot.py \
+  --env-file .env \
+  --project-number 101 \
+  --dry-run true \
+  --milestone-v215 v2.15.2 \
+  --milestone-v214 v2.14.6 \
+  --milestone-v213 v2.13.10 \
+  --milestone-v212 v2.12.14 \
+  --milestone-v211 v2.11.18
 ```
 
 ## GitHub Actions Usage
@@ -67,9 +95,25 @@ Trigger:
 - Inputs:
   - `project_number` (required)
   - `dry_run` (default: `true`)
+  - `milestone_v215` (text, default: `auto`)
+  - `milestone_v214` (text, default: `auto`)
+  - `milestone_v213` (text, default: `auto`)
+  - `milestone_v212` (text, default: `auto`)
+  - `milestone_v211` (text, default: `auto`)
+
+`auto` means the bot will resolve the latest milestone in that series at run
+time. If you pick a specific value, that exact milestone is used.
+
+Accepted values in the text box:
+- `auto`
+- A full milestone string like `v2.15.3`, `v2.14.7`, `v2.13.11`, `v2.12.18`, or `v2.11.18`
 
 The workflow uses secret:
 - `RANCHER_BOT_TOKEN` (mapped to `GH_TOKEN`)
+
+After the run completes, the workflow uploads two artifacts:
+- `release-bot-report-html` for `report.html`
+- `release-bot-report-md` for `report.md`
 
 Add this in repository settings:
 - `Settings -> Secrets and variables -> Actions -> New repository secret`
@@ -104,8 +148,7 @@ Columns:
 - Done
 
 Notes:
-- Table-cell checkbox text (`- [ ]`) is visual in GitHub tables.
-- Clickable task checkboxes are provided in the separate `Done Checklist` section.
+- Checkbox entries are rendered in the `Done` table column for each row.
 
 ## Troubleshooting
 
