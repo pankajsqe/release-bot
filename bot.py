@@ -42,7 +42,9 @@ CHARTS = [
     "prometheus-federator",
     "rancher-alerting-drivers",
     "rancher-backup",
+    "rancher-monitoring-dashboards",
 ]
+CHART_MINIMUM_RELEASES = {"rancher-monitoring-dashboards": (2, 15, 1)}
 
 REQUEST_TIMEOUT_SEC = 30
 RETRY_ATTEMPTS = 5
@@ -214,10 +216,12 @@ def find_latest_milestones(selected_titles: dict[str, str] | None = None):
     by_title = {ms.get("title", ""): ms for ms in milestones}
 
     selected_titles = selected_titles or {}
+    explicitly_selected = set()
     for series in VERSIONS:
         selected = selected_titles.get(series, "").strip()
         if not selected:
             continue
+        explicitly_selected.add(series)
 
         chosen = by_title.get(selected)
         if chosen:
@@ -237,7 +241,7 @@ def find_latest_milestones(selected_titles: dict[str, str] | None = None):
         series = m.group(1)
         if series not in VERSIONS:
             continue
-        if series in latest:
+        if series in explicitly_selected:
             continue
         patch = int(m.group(2))
         prev  = latest.get(series)
@@ -368,12 +372,31 @@ def latest_chart_versions_split(chart: str, branch: str) -> dict:
     return out
 
 
-def fetch_chart_versions() -> dict[str, dict[str, dict]]:
+def _chart_applies_to_milestone(chart: str, milestone: dict | None) -> bool:
+    minimum = CHART_MINIMUM_RELEASES.get(chart)
+    if minimum is None:
+        return True
+
+    title = milestone.get("title", "") if milestone else ""
+    match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", title)
+    return bool(match and tuple(map(int, match.groups())) >= minimum)
+
+
+def fetch_chart_versions(milestones) -> dict[str, dict[str, dict]]:
     """Return {chart: {series: released/unreleased versions with dates}}."""
     result: dict = {}
     for chart in CHARTS:
         result[chart] = {}
         for v in VERSIONS:
+            if not _chart_applies_to_milestone(chart, milestones.get(v)):
+                result[chart][v] = {
+                    "released_version": "N/A",
+                    "released_date": "",
+                    "unreleased_version": "N/A",
+                    "unreleased_date": "",
+                }
+                continue
+
             info = latest_chart_versions_split(chart, f"dev-{v}")
             result[chart][v] = info
             print(
@@ -525,12 +548,19 @@ def build_validation(milestones, board_issues, chart_versions) -> tuple[list[str
             lines.append(f"  ! {v}.x milestone not present")
 
     for chart in CHARTS:
+        applicable_versions = [
+            v for v in VERSIONS
+            if _chart_applies_to_milestone(chart, milestones.get(v))
+        ]
+        if not applicable_versions:
+            continue
+
         any_found = any(
             (
                 chart_versions.get(chart, {}).get(v, {}).get("released_version", "N/A") not in ("N/A", "")
                 or chart_versions.get(chart, {}).get(v, {}).get("unreleased_version", "N/A") not in ("N/A", "")
             )
-            for v in VERSIONS
+            for v in applicable_versions
         )
         row(f"{chart} found", any_found)
 
@@ -618,6 +648,8 @@ def build_body(milestones, board_issues, chart_versions, scc_versions, shell_ver
             "|---|---|---|---|---|",
         ]
         for chart in CHARTS:
+            if not _chart_applies_to_milestone(chart, ms):
+                continue
             info = chart_versions.get(chart, {}).get(v, {})
             rel_cell, unrel_cell, _, _ = _format_chart_version_cells(info)
             lines.append(f"| {chart} | {rel_cell} | {unrel_cell} |  | [ ] |")
@@ -751,6 +783,8 @@ def write_html(milestones, board_issues, chart_versions, scc_versions, shell_ver
         label = ms["title"] if ms else f"{v}.x"
         rows  = ""
         for chart in CHARTS:
+            if not _chart_applies_to_milestone(chart, ms):
+                continue
             info    = chart_versions[chart].get(v, {})
             rel_cell, unrel_cell, rel_na, unrel_na = _format_chart_version_cells(info)
             rel_na_cls = " class='na'" if rel_na else ""
@@ -949,7 +983,7 @@ def main():
         print(f"    → {len(board_issues[v])} issues")
 
     print("Fetching chart versions …")
-    chart_versions = fetch_chart_versions()
+    chart_versions = fetch_chart_versions(milestones)
 
     print("Fetching SCC versions …")
     scc_versions = fetch_scc_versions()
